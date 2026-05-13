@@ -285,10 +285,27 @@
         object-fit: contain;
       }
 
+      .media audio,
+      .media video {
+        display: block;
+        width: min(420px, 100%);
+        max-height: 320px;
+      }
+
       .media a {
         color: #7dd3fc;
         font-size: 13px;
         text-decoration: none;
+      }
+
+      .download-link {
+        display: inline-flex;
+        align-items: center;
+        min-height: 30px;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 0 10px;
+        background: rgba(255, 255, 255, 0.04);
       }
 
       .search-result {
@@ -747,7 +764,7 @@
         els.messagesList.innerHTML = messages.map((message) => `
           <div class="message-row ${message.fromMe ? 'own' : ''}">
             <div class="bubble">
-              <div class="text">${html(message.text || `[${message.messageType || 'message'}]`)}</div>
+              ${renderMessageText(message)}
               ${renderMedia(message)}
               <div class="time">${html(message.pushName || '')} ${html(formatTime(message.timestamp))}</div>
             </div>
@@ -761,10 +778,23 @@
         if (!message.media || !message.media.url) return '';
         const label = message.media.fileName || message.media.mimeType || 'media';
         const mediaUrl = withToken(message.media.url);
+        const mimeType = String(message.media.mimeType || '');
         if (String(message.media.mimeType || '').startsWith('image/')) {
           return `<div class="media"><a href="${html(mediaUrl)}" target="_blank" rel="noopener"><img src="${html(mediaUrl)}" alt="${html(label)}"></a></div>`;
         }
-        return `<div class="media"><a href="${html(mediaUrl)}" target="_blank" rel="noopener">Открыть медиа: ${html(label)}</a></div>`;
+        if (mimeType.startsWith('audio/') || message.messageType === 'audioMessage') {
+          return `<div class="media"><audio controls preload="metadata" src="${html(mediaUrl)}"></audio><a href="${html(mediaUrl)}" download="${html(label)}">Скачать голосовое</a></div>`;
+        }
+        if (mimeType.startsWith('video/') || message.messageType === 'videoMessage') {
+          return `<div class="media"><video controls preload="metadata" src="${html(mediaUrl)}"></video><a href="${html(mediaUrl)}" download="${html(label)}">Скачать видео</a></div>`;
+        }
+        return `<div class="media"><a class="download-link" href="${html(mediaUrl)}" download="${html(label)}" target="_blank" rel="noopener">Скачать: ${html(label)}</a></div>`;
+      }
+
+      function renderMessageText(message) {
+        if (message.text) return `<div class="text">${html(message.text)}</div>`;
+        if (message.media) return '';
+        return `<div class="text">${html(`[${message.messageType || 'message'}]`)}</div>`;
       }
 
       function render() {

@@ -256,7 +256,11 @@ const socketClientToGateway = createSocketClient(PUBLIC_GATEWAY_URL, {
 
 app.use(express.json({ limit: '256kb' }));
 app.use('/ui', express.static(path.join(__dirname, 'private-ui')));
-app.use('/ui/media', privateUiAuth, express.static(MEDIA_DIR));
+app.use('/ui/media', privateUiAuth, express.static(MEDIA_DIR, {
+  setHeaders: (res, filePath) => {
+    res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(path.basename(filePath))}"`);
+  }
+}));
 
 function normalizePhoneNumber(phoneNumber) {
   return String(phoneNumber || '').replace(/\D/g, '');
@@ -498,16 +502,25 @@ function getMediaInfo(content) {
   for (const [key, kind] of mediaTypes) {
     if (!content || !content[key]) continue;
     const media = content[key];
+    const mimeType = media.mimetype || '';
     return {
       kind,
-      mimeType: media.mimetype || '',
-      fileName: media.fileName || media.title || '',
+      mimeType,
+      fileName: media.fileName || media.title || defaultMediaFileName(kind, mimeType),
       fileLength: Number(media.fileLength && media.fileLength.low ? media.fileLength.low : media.fileLength || 0),
       caption: media.caption || ''
     };
   }
 
   return null;
+}
+
+function defaultMediaFileName(kind, mimeType) {
+  if (kind === 'audio') return `voice.${fileExtensionFromMime(mimeType, 'ogg')}`;
+  if (kind === 'image') return `image.${fileExtensionFromMime(mimeType, 'jpg')}`;
+  if (kind === 'video') return `video.${fileExtensionFromMime(mimeType, 'mp4')}`;
+  if (kind === 'sticker') return `sticker.${fileExtensionFromMime(mimeType, 'webp')}`;
+  return `document.${fileExtensionFromMime(mimeType, 'bin')}`;
 }
 
 function rowToAccount(row) {
@@ -571,6 +584,7 @@ function jidToSafeName(jid) {
 }
 
 function fileExtensionFromMime(mimeType, fallback = 'bin') {
+  const normalized = String(mimeType || '').split(';')[0].trim().toLowerCase();
   const map = {
     'image/jpeg': 'jpg',
     'image/png': 'png',
@@ -581,7 +595,7 @@ function fileExtensionFromMime(mimeType, fallback = 'bin') {
     'application/pdf': 'pdf'
   };
 
-  return map[mimeType] || fallback;
+  return map[normalized] || fallback;
 }
 
 function storeContact(phoneNumber, contact) {
@@ -629,7 +643,9 @@ async function downloadAndStoreMedia(phoneNumber, publicMessage, rawMessage) {
   fs.mkdirSync(chatDir, { recursive: true });
 
   const extension = fileExtensionFromMime(publicMessage.media.mimeType, publicMessage.media.kind || 'bin');
-  const fileName = `${jidToSafeName(publicMessage.id || String(Date.now()))}.${extension}`;
+  const sourceName = publicMessage.media.fileName || defaultMediaFileName(publicMessage.media.kind, publicMessage.media.mimeType);
+  const sourceStem = path.parse(sourceName).name || publicMessage.media.kind || 'media';
+  const fileName = `${jidToSafeName(publicMessage.id || String(Date.now()))}-${jidToSafeName(sourceStem)}.${extension}`;
   const absolutePath = path.join(chatDir, fileName);
   const relativePath = path.relative(MEDIA_DIR, absolutePath).replace(/\\/g, '/');
 
