@@ -31,7 +31,7 @@ fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 
 const logger = pino({
   level: process.env.LOG_LEVEL || 'debug',
-  redact: ['req.headers.x-gateway-secret', '*.auth', '*.creds']
+  redact: ['req.headers["x-gateway-secret"]', '*.auth', '*.creds']
 });
 
 const app = express();
