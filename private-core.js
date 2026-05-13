@@ -50,6 +50,7 @@ const activeSockets = new Map();
 const accountStatuses = new Map();
 const latestChats = new Map();
 const latestMessages = new Map();
+const chatMessageCursors = new Map();
 let baileysVersionPromise = null;
 
 const socketClientToGateway = createSocketClient(PUBLIC_GATEWAY_URL, {
@@ -163,9 +164,48 @@ function asUnixTimestamp(value) {
   return Number(value) || Math.floor(Date.now() / 1000);
 }
 
+function unwrapMessageContent(content) {
+  let current = content || {};
+
+  for (let index = 0; index < 5; index += 1) {
+    if (current.ephemeralMessage && current.ephemeralMessage.message) {
+      current = current.ephemeralMessage.message;
+      continue;
+    }
+
+    if (current.viewOnceMessage && current.viewOnceMessage.message) {
+      current = current.viewOnceMessage.message;
+      continue;
+    }
+
+    if (current.viewOnceMessageV2 && current.viewOnceMessageV2.message) {
+      current = current.viewOnceMessageV2.message;
+      continue;
+    }
+
+    if (current.documentWithCaptionMessage && current.documentWithCaptionMessage.message) {
+      current = current.documentWithCaptionMessage.message;
+      continue;
+    }
+
+    if (current.editedMessage && current.editedMessage.message) {
+      current = current.editedMessage.message;
+      continue;
+    }
+
+    return current;
+  }
+
+  return current;
+}
+
+function getMessageContent(message) {
+  return unwrapMessageContent(message && message.message ? message.message : {});
+}
+
 function getMessageText(message) {
   if (!message) return '';
-  const content = message.message || {};
+  const content = getMessageContent(message);
 
   if (content.conversation) return content.conversation;
   if (content.extendedTextMessage && content.extendedTextMessage.text) return content.extendedTextMessage.text;
@@ -181,6 +221,7 @@ function getMessageText(message) {
 
 function toPublicMessage(message) {
   const remoteJid = message.key && message.key.remoteJid;
+  const content = getMessageContent(message);
   return {
     id: message.key && message.key.id,
     chatId: remoteJid,
@@ -189,8 +230,17 @@ function toPublicMessage(message) {
     pushName: message.pushName || '',
     text: getMessageText(message),
     timestamp: asUnixTimestamp(message.messageTimestamp),
-    messageType: Object.keys(message.message || {})[0] || 'unknown'
+    messageType: Object.keys(content || {})[0] || 'unknown'
   };
+}
+
+function shouldExposeMessage(publicMessage) {
+  if (!publicMessage || !publicMessage.chatId) return false;
+  if (publicMessage.messageType === 'protocolMessage') return false;
+  if (publicMessage.messageType === 'senderKeyDistributionMessage') return false;
+  if (publicMessage.messageType === 'messageContextInfo') return false;
+  if (!publicMessage.text && publicMessage.messageType === 'unknown') return false;
+  return Boolean(publicMessage.text || publicMessage.fromMe || publicMessage.messageType !== 'unknown');
 }
 
 function toPublicChat(chat) {
@@ -208,6 +258,7 @@ function toPublicChat(chat) {
 
 function storePublicMessage(phoneNumber, chatId, message) {
   if (!phoneNumber || !chatId || !message) return;
+  if (!shouldExposeMessage(message)) return;
 
   const key = `${phoneNumber}::${chatId}`;
   const messages = latestMessages.get(key) || [];
@@ -224,6 +275,13 @@ function storePublicMessage(phoneNumber, chatId, message) {
   }
 
   latestMessages.set(key, messages);
+
+  if (message.id) {
+    chatMessageCursors.set(key, {
+      id: message.id,
+      fromMe: Boolean(message.fromMe)
+    });
+  }
 }
 
 function getMessagesSnapshot(phoneNumber, chatId) {
@@ -246,6 +304,60 @@ function getStateSnapshot() {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function ingestMessages(phoneNumber, messages, emitMessages = true) {
+  let changed = false;
+
+  for (const message of messages || []) {
+    if (!message.message || !message.key || !message.key.remoteJid) continue;
+
+    const publicMessage = toPublicMessage(message);
+    if (!shouldExposeMessage(publicMessage)) continue;
+
+    storePublicMessage(phoneNumber, publicMessage.chatId, publicMessage);
+    changed = true;
+
+    if (emitMessages) {
+      emitGateway('new-message', {
+        phoneNumber,
+        chatId: publicMessage.chatId,
+        message: publicMessage
+      });
+    }
+
+    const accountChats = latestChats.get(phoneNumber) || new Map();
+    const previousChat = accountChats.get(publicMessage.chatId) || { id: publicMessage.chatId };
+    accountChats.set(publicMessage.chatId, {
+      ...previousChat,
+      id: publicMessage.chatId,
+      name: publicMessage.pushName || previousChat.name || publicMessage.chatId,
+      lastMessage: publicMessage.text || previousChat.lastMessage || '',
+      timestamp: publicMessage.timestamp
+    });
+    latestChats.set(phoneNumber, accountChats);
+  }
+
+  if (changed) {
+    sendChatsSnapshot(phoneNumber);
+  }
+
+  return changed;
+}
+
+async function backfillChatMessages(phoneNumber, chatId, count = 30) {
+  const sock = activeSockets.get(phoneNumber);
+  if (!sock || typeof sock.loadMessages !== 'function') return;
+
+  const key = `${phoneNumber}::${chatId}`;
+  const cursor = chatMessageCursors.get(key);
+
+  try {
+    const messages = await sock.loadMessages(chatId, count, cursor);
+    ingestMessages(phoneNumber, messages || [], false);
+  } catch (error) {
+    logger.warn({ phoneNumber, chatId, error: error.message }, 'failed to backfill chat messages');
+  }
 }
 
 async function requestPairingCodeWithRetry(sock, phoneNumber) {
@@ -388,30 +500,7 @@ async function createSession(phoneNumber, options = {}) {
   });
 
   sock.ev.on('messages.upsert', ({ messages }) => {
-    for (const message of messages || []) {
-      if (!message.message || !message.key || !message.key.remoteJid) continue;
-
-      const publicMessage = toPublicMessage(message);
-      storePublicMessage(normalizedPhone, publicMessage.chatId, publicMessage);
-      emitGateway('new-message', {
-        phoneNumber: normalizedPhone,
-        chatId: publicMessage.chatId,
-        message: publicMessage
-      });
-
-      const accountChats = latestChats.get(normalizedPhone) || new Map();
-      const previousChat = accountChats.get(publicMessage.chatId) || { id: publicMessage.chatId };
-      accountChats.set(publicMessage.chatId, {
-        ...previousChat,
-        id: publicMessage.chatId,
-        name: publicMessage.pushName || previousChat.name || publicMessage.chatId,
-        lastMessage: publicMessage.text,
-        timestamp: publicMessage.timestamp
-      });
-      latestChats.set(normalizedPhone, accountChats);
-    }
-
-    sendChatsSnapshot(normalizedPhone);
+    ingestMessages(normalizedPhone, messages || [], true);
   });
 
   sock.ev.on('chats.upsert', (chats) => {
@@ -425,16 +514,7 @@ async function createSession(phoneNumber, options = {}) {
   sock.ev.on('messaging-history.set', ({ chats, messages }) => {
     mergeAndSendChats(normalizedPhone, chats || []);
 
-    for (const message of messages || []) {
-      if (!message.message || !message.key || !message.key.remoteJid) continue;
-      const publicMessage = toPublicMessage(message);
-      storePublicMessage(normalizedPhone, publicMessage.chatId, publicMessage);
-      emitGateway('new-message', {
-        phoneNumber: normalizedPhone,
-        chatId: publicMessage.chatId,
-        message: publicMessage
-      });
-    }
+    ingestMessages(normalizedPhone, messages || [], true);
   });
 
   return sock;
@@ -484,13 +564,15 @@ app.get('/ui/api/state', privateUiAuth, (req, res) => {
   res.json(getStateSnapshot());
 });
 
-app.get('/ui/api/messages/:phoneNumber/:chatId', privateUiAuth, (req, res) => {
+app.get('/ui/api/messages/:phoneNumber/:chatId', privateUiAuth, async (req, res) => {
   const phoneNumber = normalizePhoneNumber(req.params.phoneNumber);
   const chatId = String(req.params.chatId || '');
 
   if (!phoneNumber || !chatId) {
     return res.status(400).json({ error: 'phoneNumber and chatId are required' });
   }
+
+  await backfillChatMessages(phoneNumber, chatId, Number(req.query.limit || 30));
 
   return res.json({
     phoneNumber,
@@ -537,6 +619,12 @@ app.delete('/api/accounts/:phoneNumber', gatewayAuth, async (req, res) => {
     for (const key of latestMessages.keys()) {
       if (key.startsWith(`${phoneNumber}::`)) {
         latestMessages.delete(key);
+      }
+    }
+
+    for (const key of chatMessageCursors.keys()) {
+      if (key.startsWith(`${phoneNumber}::`)) {
+        chatMessageCursors.delete(key);
       }
     }
 
