@@ -1,0 +1,634 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Private WhatsApp Viewer</title>
+    <script src="/socket.io/socket.io.js"></script>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #101114;
+        --panel: #17191d;
+        --panel-2: #1f2228;
+        --border: #30343c;
+        --text: #f4f4f5;
+        --muted: #a1a1aa;
+        --soft: #71717a;
+        --accent: #34d399;
+        --warn: #fbbf24;
+        --danger: #fb7185;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: var(--bg);
+        color: var(--text);
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      button,
+      input {
+        font: inherit;
+      }
+
+      .app {
+        display: grid;
+        grid-template-rows: auto 1fr;
+        min-height: 100vh;
+      }
+
+      .topbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        min-height: 64px;
+        padding: 12px 18px;
+        border-bottom: 1px solid var(--border);
+        background: #121317;
+      }
+
+      .brand {
+        min-width: 0;
+      }
+
+      .brand h1 {
+        margin: 0;
+        font-size: 18px;
+        font-weight: 650;
+        letter-spacing: 0;
+      }
+
+      .brand p {
+        margin: 4px 0 0;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .status {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        white-space: nowrap;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .dot {
+        width: 9px;
+        height: 9px;
+        border-radius: 999px;
+        background: var(--soft);
+      }
+
+      .dot.active {
+        background: var(--accent);
+      }
+
+      .dot.pending,
+      .dot.connecting {
+        background: var(--warn);
+      }
+
+      .dot.error,
+      .dot.disconnected {
+        background: var(--danger);
+      }
+
+      .layout {
+        display: grid;
+        grid-template-columns: 280px 340px minmax(0, 1fr);
+        min-height: 0;
+      }
+
+      .column {
+        min-height: 0;
+        border-right: 1px solid var(--border);
+        background: var(--panel);
+        overflow: hidden;
+      }
+
+      .column-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        height: 48px;
+        padding: 0 14px;
+        border-bottom: 1px solid var(--border);
+        color: var(--muted);
+        font-size: 13px;
+        font-weight: 650;
+      }
+
+      .scroll {
+        height: calc(100vh - 113px);
+        overflow: auto;
+      }
+
+      .item {
+        width: 100%;
+        border: 0;
+        border-bottom: 1px solid rgba(48, 52, 60, 0.72);
+        background: transparent;
+        color: var(--text);
+        cursor: pointer;
+        display: flex;
+        gap: 10px;
+        padding: 12px 14px;
+        text-align: left;
+      }
+
+      .item:hover,
+      .item.selected {
+        background: var(--panel-2);
+      }
+
+      .item-main {
+        min-width: 0;
+        flex: 1;
+      }
+
+      .item-title {
+        display: block;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 14px;
+        font-weight: 600;
+      }
+
+      .item-meta {
+        display: block;
+        margin-top: 4px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .viewer {
+        display: grid;
+        grid-template-rows: auto 1fr;
+        min-width: 0;
+        min-height: 0;
+        background: #111216;
+      }
+
+      .chat-head {
+        min-height: 64px;
+        padding: 12px 18px;
+        border-bottom: 1px solid var(--border);
+      }
+
+      .chat-head h2 {
+        margin: 0;
+        overflow-wrap: anywhere;
+        font-size: 16px;
+        font-weight: 650;
+      }
+
+      .chat-head p {
+        margin: 5px 0 0;
+        color: var(--muted);
+        font-size: 12px;
+        overflow-wrap: anywhere;
+      }
+
+      .messages {
+        min-height: 0;
+        overflow: auto;
+        padding: 18px;
+      }
+
+      .empty {
+        padding: 28px 16px;
+        color: var(--soft);
+        font-size: 14px;
+        text-align: center;
+      }
+
+      .message-row {
+        display: flex;
+        margin: 8px 0;
+      }
+
+      .message-row.own {
+        justify-content: flex-end;
+      }
+
+      .bubble {
+        max-width: min(720px, 78%);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--panel);
+        padding: 9px 11px;
+      }
+
+      .own .bubble {
+        border-color: rgba(52, 211, 153, 0.38);
+        background: rgba(52, 211, 153, 0.12);
+      }
+
+      .text {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        font-size: 14px;
+        line-height: 1.45;
+      }
+
+      .time {
+        margin-top: 5px;
+        color: var(--muted);
+        font-size: 11px;
+        text-align: right;
+      }
+
+      .auth {
+        display: none;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .auth.visible {
+        display: flex;
+      }
+
+      .auth input {
+        height: 34px;
+        width: 230px;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: var(--panel);
+        color: var(--text);
+        padding: 0 10px;
+        outline: 0;
+      }
+
+      .auth button,
+      .small-button {
+        height: 34px;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: var(--panel-2);
+        color: var(--text);
+        cursor: pointer;
+        padding: 0 11px;
+      }
+
+      @media (max-width: 900px) {
+        .layout {
+          grid-template-columns: 1fr;
+        }
+
+        .column {
+          border-right: 0;
+          border-bottom: 1px solid var(--border);
+        }
+
+        .scroll {
+          height: 220px;
+        }
+
+        .viewer {
+          min-height: 520px;
+        }
+
+        .topbar {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="app">
+      <header class="topbar">
+        <div class="brand">
+          <h1>Private WhatsApp Viewer</h1>
+          <p>Просмотр аккаунтов, чатов и сообщений на приватном ядре</p>
+        </div>
+        <form id="authForm" class="auth">
+          <input id="tokenInput" type="password" placeholder="PRIVATE_UI_TOKEN" autocomplete="current-password">
+          <button type="submit">Войти</button>
+        </form>
+        <div class="status">
+          <span id="statusDot" class="dot"></span>
+          <span id="statusText">подключение</span>
+          <button id="refreshButton" class="small-button" type="button">Обновить</button>
+        </div>
+      </header>
+
+      <section class="layout">
+        <aside class="column">
+          <div class="column-header">
+            <span>Аккаунты</span>
+            <span id="accountsCount">0</span>
+          </div>
+          <div id="accountsList" class="scroll"></div>
+        </aside>
+
+        <aside class="column">
+          <div class="column-header">
+            <span>Чаты</span>
+            <span id="chatsCount">0</span>
+          </div>
+          <div id="chatsList" class="scroll"></div>
+        </aside>
+
+        <section class="viewer">
+          <div class="chat-head">
+            <h2 id="chatTitle">Выберите аккаунт и чат</h2>
+            <p id="chatSubtitle"></p>
+          </div>
+          <div id="messagesList" class="messages"></div>
+        </section>
+      </section>
+    </main>
+
+    <script>
+      const state = {
+        accounts: [],
+        chatsByAccount: {},
+        messagesByChat: {},
+        selectedAccount: '',
+        selectedChat: '',
+        token: localStorage.getItem('privateUiToken') || '',
+        socket: null
+      };
+
+      const els = {
+        authForm: document.getElementById('authForm'),
+        tokenInput: document.getElementById('tokenInput'),
+        statusDot: document.getElementById('statusDot'),
+        statusText: document.getElementById('statusText'),
+        refreshButton: document.getElementById('refreshButton'),
+        accountsCount: document.getElementById('accountsCount'),
+        chatsCount: document.getElementById('chatsCount'),
+        accountsList: document.getElementById('accountsList'),
+        chatsList: document.getElementById('chatsList'),
+        chatTitle: document.getElementById('chatTitle'),
+        chatSubtitle: document.getElementById('chatSubtitle'),
+        messagesList: document.getElementById('messagesList')
+      };
+
+      function key(account, chat) {
+        return `${account}::${chat}`;
+      }
+
+      function html(value) {
+        return String(value || '').replace(/[&<>"']/g, (char) => ({
+          '&': '&amp;',
+          '<': '&lt;',
+          '>': '&gt;',
+          '"': '&quot;',
+          "'": '&#039;'
+        }[char]));
+      }
+
+      function formatTime(value) {
+        if (!value) return '';
+        const date = new Date(Number(value) * 1000);
+        return Number.isNaN(date.getTime()) ? '' : date.toLocaleString();
+      }
+
+      function statusLabel(status) {
+        return {
+          active: 'активен',
+          pending: 'ожидание кода',
+          connecting: 'подключение',
+          disconnected: 'отключен',
+          error: 'ошибка'
+        }[status] || status || 'неизвестно';
+      }
+
+      async function api(path) {
+        const response = await fetch(path, {
+          headers: state.token ? { 'X-Private-Ui-Token': state.token } : {}
+        });
+
+        if (response.status === 401) {
+          els.authForm.classList.add('visible');
+          throw new Error('Нужен PRIVATE_UI_TOKEN');
+        }
+
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Ошибка запроса');
+        return data;
+      }
+
+      async function loadState() {
+        const data = await api('/ui/api/state');
+        state.accounts = data.accounts || [];
+        state.chatsByAccount = data.chatsByAccount || {};
+
+        if (!state.selectedAccount && state.accounts[0]) {
+          state.selectedAccount = state.accounts[0].phoneNumber;
+        }
+
+        const chats = state.chatsByAccount[state.selectedAccount] || [];
+        if (!state.selectedChat && chats[0]) {
+          state.selectedChat = chats[0].id;
+          await loadMessages(state.selectedAccount, state.selectedChat);
+        }
+
+        render();
+      }
+
+      async function loadMessages(account, chat) {
+        if (!account || !chat) return;
+        const data = await api(`/ui/api/messages/${encodeURIComponent(account)}/${encodeURIComponent(chat)}`);
+        state.messagesByChat[key(account, chat)] = data.messages || [];
+      }
+
+      function connectSocket() {
+        if (state.socket) state.socket.close();
+
+        state.socket = io({
+          auth: {
+            role: 'private-ui',
+            token: state.token
+          }
+        });
+
+        state.socket.on('connect', () => {
+          els.statusDot.className = 'dot active';
+          els.statusText.textContent = 'ui подключен';
+        });
+
+        state.socket.on('disconnect', () => {
+          els.statusDot.className = 'dot disconnected';
+          els.statusText.textContent = 'ui отключен';
+        });
+
+        state.socket.on('connect_error', () => {
+          els.statusDot.className = 'dot error';
+          els.statusText.textContent = 'нет доступа';
+          els.authForm.classList.add('visible');
+        });
+
+        state.socket.on('private-ui-ready', (data) => {
+          state.accounts = data.accounts || [];
+          state.chatsByAccount = data.chatsByAccount || {};
+          render();
+        });
+
+        state.socket.on('account-status', (payload) => {
+          if (!payload.phoneNumber) return;
+          const existing = state.accounts.find((item) => item.phoneNumber === payload.phoneNumber);
+          if (existing) Object.assign(existing, payload);
+          else state.accounts.push(payload);
+          if (!state.selectedAccount) state.selectedAccount = payload.phoneNumber;
+          render();
+        });
+
+        state.socket.on('chats-update', (payload) => {
+          if (!payload.phoneNumber) return;
+          state.chatsByAccount[payload.phoneNumber] = payload.chats || [];
+          render();
+        });
+
+        state.socket.on('new-message', (payload) => {
+          if (!payload.phoneNumber || !payload.chatId || !payload.message) return;
+          const chatMessagesKey = key(payload.phoneNumber, payload.chatId);
+          const messages = state.messagesByChat[chatMessagesKey] || [];
+          if (!payload.message.id || !messages.some((message) => message.id === payload.message.id)) {
+            messages.push(payload.message);
+          }
+          state.messagesByChat[chatMessagesKey] = messages;
+          render();
+        });
+      }
+
+      function renderAccounts() {
+        els.accountsCount.textContent = String(state.accounts.length);
+
+        if (!state.accounts.length) {
+          els.accountsList.innerHTML = '<div class="empty">Аккаунтов пока нет</div>';
+          return;
+        }
+
+        els.accountsList.innerHTML = state.accounts.map((account) => `
+          <button class="item ${account.phoneNumber === state.selectedAccount ? 'selected' : ''}" data-account="${html(account.phoneNumber)}">
+            <span class="dot ${html(account.status)}"></span>
+            <span class="item-main">
+              <span class="item-title">${html(account.phoneNumber)}</span>
+              <span class="item-meta">${html(statusLabel(account.status))}</span>
+            </span>
+          </button>
+        `).join('');
+
+        els.accountsList.querySelectorAll('[data-account]').forEach((button) => {
+          button.addEventListener('click', () => {
+            state.selectedAccount = button.dataset.account;
+            state.selectedChat = '';
+            const chats = state.chatsByAccount[state.selectedAccount] || [];
+            if (chats[0]) state.selectedChat = chats[0].id;
+            if (state.selectedChat) loadMessages(state.selectedAccount, state.selectedChat).finally(render);
+            else render();
+          });
+        });
+      }
+
+      function renderChats() {
+        const chats = state.chatsByAccount[state.selectedAccount] || [];
+        els.chatsCount.textContent = String(chats.length);
+
+        if (!state.selectedAccount) {
+          els.chatsList.innerHTML = '<div class="empty">Выберите аккаунт</div>';
+          return;
+        }
+
+        if (!chats.length) {
+          els.chatsList.innerHTML = '<div class="empty">Чаты появятся после синхронизации</div>';
+          return;
+        }
+
+        els.chatsList.innerHTML = chats.map((chat) => `
+          <button class="item ${chat.id === state.selectedChat ? 'selected' : ''}" data-chat="${html(chat.id)}">
+            <span class="item-main">
+              <span class="item-title">${html(chat.name || chat.subject || chat.id)}</span>
+              <span class="item-meta">${html(chat.lastMessage || chat.id)}</span>
+            </span>
+          </button>
+        `).join('');
+
+        els.chatsList.querySelectorAll('[data-chat]').forEach((button) => {
+          button.addEventListener('click', () => {
+            state.selectedChat = button.dataset.chat;
+            loadMessages(state.selectedAccount, state.selectedChat).finally(render);
+          });
+        });
+      }
+
+      function renderMessages() {
+        const account = state.selectedAccount;
+        const chat = state.selectedChat;
+        const chats = state.chatsByAccount[account] || [];
+        const selected = chats.find((item) => item.id === chat);
+        const messages = state.messagesByChat[key(account, chat)] || [];
+
+        els.chatTitle.textContent = selected ? (selected.name || selected.subject || selected.id) : 'Выберите аккаунт и чат';
+        els.chatSubtitle.textContent = selected ? `${account} | ${selected.id}` : '';
+
+        if (!account || !chat) {
+          els.messagesList.innerHTML = '<div class="empty">Сообщения появятся после выбора чата</div>';
+          return;
+        }
+
+        if (!messages.length) {
+          els.messagesList.innerHTML = '<div class="empty">Для этого чата пока нет сообщений в памяти процесса</div>';
+          return;
+        }
+
+        els.messagesList.innerHTML = messages.map((message) => `
+          <div class="message-row ${message.fromMe ? 'own' : ''}">
+            <div class="bubble">
+              <div class="text">${html(message.text || `[${message.messageType || 'message'}]`)}</div>
+              <div class="time">${html(message.pushName || '')} ${html(formatTime(message.timestamp))}</div>
+            </div>
+          </div>
+        `).join('');
+
+        els.messagesList.scrollTop = els.messagesList.scrollHeight;
+      }
+
+      function render() {
+        renderAccounts();
+        renderChats();
+        renderMessages();
+      }
+
+      els.authForm.addEventListener('submit', (event) => {
+        event.preventDefault();
+        state.token = els.tokenInput.value.trim();
+        localStorage.setItem('privateUiToken', state.token);
+        els.authForm.classList.remove('visible');
+        connectSocket();
+        loadState().catch((error) => {
+          els.statusDot.className = 'dot error';
+          els.statusText.textContent = error.message;
+        });
+      });
+
+      els.refreshButton.addEventListener('click', () => {
+        loadState().catch((error) => {
+          els.statusText.textContent = error.message;
+        });
+      });
+
+      connectSocket();
+      loadState().catch((error) => {
+        els.statusDot.className = 'dot error';
+        els.statusText.textContent = error.message;
+      });
+    </script>
+  </body>
+</html>

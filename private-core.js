@@ -18,6 +18,8 @@ const PRIVATE_PORT = Number(process.env.PRIVATE_PORT || 4000);
 const PUBLIC_GATEWAY_URL = (process.env.PUBLIC_GATEWAY_URL || '').replace(/\/$/, '');
 const GATEWAY_SECRET = process.env.GATEWAY_SECRET || '';
 const SESSIONS_DIR = path.resolve(process.env.SESSIONS_DIR || './sessions');
+const PRIVATE_UI_TOKEN = process.env.PRIVATE_UI_TOKEN || '';
+const MAX_STORED_MESSAGES_PER_CHAT = Number(process.env.MAX_STORED_MESSAGES_PER_CHAT || 500);
 
 if (!PUBLIC_GATEWAY_URL) {
   throw new Error('PUBLIC_GATEWAY_URL is required');
@@ -45,6 +47,7 @@ const privateIo = new Server(server, {
 const activeSockets = new Map();
 const accountStatuses = new Map();
 const latestChats = new Map();
+const latestMessages = new Map();
 let baileysVersionPromise = null;
 
 const socketClientToGateway = createSocketClient(PUBLIC_GATEWAY_URL, {
@@ -59,6 +62,7 @@ const socketClientToGateway = createSocketClient(PUBLIC_GATEWAY_URL, {
 });
 
 app.use(express.json({ limit: '256kb' }));
+app.use('/ui', express.static(path.join(__dirname, 'private-ui')));
 
 function normalizePhoneNumber(phoneNumber) {
   return String(phoneNumber || '').replace(/\D/g, '');
@@ -88,6 +92,19 @@ function setStatus(phoneNumber, status, extra = {}) {
 function emitGateway(eventName, payload) {
   socketClientToGateway.emit(eventName, payload);
   privateIo.to('public-gateway').emit(eventName, payload);
+  privateIo.to('private-ui').emit(eventName, payload);
+}
+
+function isPrivateUiTokenValid(token) {
+  return !PRIVATE_UI_TOKEN || token === PRIVATE_UI_TOKEN;
+}
+
+function privateUiAuth(req, res, next) {
+  const token = req.header('X-Private-Ui-Token') || req.query.token || '';
+  if (!isPrivateUiTokenValid(token)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  return next();
 }
 
 function gatewayAuth(req, res, next) {
@@ -144,6 +161,44 @@ function toPublicChat(chat) {
     archived: Boolean(chat.archived),
     pinned: Boolean(chat.pinned),
     lastMessage: chat.lastMessage || ''
+  };
+}
+
+function storePublicMessage(phoneNumber, chatId, message) {
+  if (!phoneNumber || !chatId || !message) return;
+
+  const key = `${phoneNumber}::${chatId}`;
+  const messages = latestMessages.get(key) || [];
+
+  if (message.id && messages.some((item) => item.id === message.id)) {
+    return;
+  }
+
+  messages.push(message);
+  messages.sort((a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0));
+
+  if (messages.length > MAX_STORED_MESSAGES_PER_CHAT) {
+    messages.splice(0, messages.length - MAX_STORED_MESSAGES_PER_CHAT);
+  }
+
+  latestMessages.set(key, messages);
+}
+
+function getMessagesSnapshot(phoneNumber, chatId) {
+  return latestMessages.get(`${phoneNumber}::${chatId}`) || [];
+}
+
+function getStateSnapshot() {
+  const chatsByAccount = {};
+
+  for (const [phoneNumber, chats] of latestChats.entries()) {
+    chatsByAccount[phoneNumber] = Array.from(chats.values()).sort((a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0));
+  }
+
+  return {
+    accounts: Array.from(accountStatuses.values()).sort((a, b) => a.phoneNumber.localeCompare(b.phoneNumber)),
+    chatsByAccount,
+    publicGatewayConnected: socketClientToGateway.connected
   };
 }
 
@@ -248,6 +303,7 @@ async function createSession(phoneNumber, options = {}) {
       if (!message.message || !message.key || !message.key.remoteJid) continue;
 
       const publicMessage = toPublicMessage(message);
+      storePublicMessage(normalizedPhone, publicMessage.chatId, publicMessage);
       emitGateway('new-message', {
         phoneNumber: normalizedPhone,
         chatId: publicMessage.chatId,
@@ -283,6 +339,7 @@ async function createSession(phoneNumber, options = {}) {
     for (const message of messages || []) {
       if (!message.message || !message.key || !message.key.remoteJid) continue;
       const publicMessage = toPublicMessage(message);
+      storePublicMessage(normalizedPhone, publicMessage.chatId, publicMessage);
       emitGateway('new-message', {
         phoneNumber: normalizedPhone,
         chatId: publicMessage.chatId,
@@ -339,6 +396,29 @@ app.get('/health', (req, res) => {
   });
 });
 
+app.get('/ui', (req, res) => {
+  res.sendFile(path.join(__dirname, 'private-ui', 'index.html'));
+});
+
+app.get('/ui/api/state', privateUiAuth, (req, res) => {
+  res.json(getStateSnapshot());
+});
+
+app.get('/ui/api/messages/:phoneNumber/:chatId', privateUiAuth, (req, res) => {
+  const phoneNumber = normalizePhoneNumber(req.params.phoneNumber);
+  const chatId = String(req.params.chatId || '');
+
+  if (!phoneNumber || !chatId) {
+    return res.status(400).json({ error: 'phoneNumber and chatId are required' });
+  }
+
+  return res.json({
+    phoneNumber,
+    chatId,
+    messages: getMessagesSnapshot(phoneNumber, chatId)
+  });
+});
+
 app.post('/api/add-account', gatewayAuth, async (req, res) => {
   const phoneNumber = normalizePhoneNumber(req.body.phoneNumber);
 
@@ -362,7 +442,21 @@ app.get('/api/accounts', gatewayAuth, (req, res) => {
 });
 
 privateIo.on('connection', (socket) => {
-  if (!socket.handshake.auth || socket.handshake.auth.role !== 'public-gateway' || socket.handshake.auth.secret !== GATEWAY_SECRET) {
+  const auth = socket.handshake.auth || {};
+
+  if (auth.role === 'private-ui') {
+    if (!isPrivateUiTokenValid(auth.token || '')) {
+      socket.emit('private-core-error', { error: 'Unauthorized' });
+      socket.disconnect(true);
+      return;
+    }
+
+    socket.join('private-ui');
+    socket.emit('private-ui-ready', getStateSnapshot());
+    return;
+  }
+
+  if (auth.role !== 'public-gateway' || auth.secret !== GATEWAY_SECRET) {
     socket.emit('private-core-error', { error: 'Unauthorized' });
     socket.disconnect(true);
     return;
@@ -422,6 +516,7 @@ async function handleSendMessage(payload, ack) {
       messageType: 'conversation'
     };
 
+    storePublicMessage(accountId, to, publicMessage);
     emitGateway('new-message', {
       phoneNumber: accountId,
       chatId: to,
