@@ -12,6 +12,7 @@ const {
   default: makeWASocket,
   Browsers,
   DisconnectReason,
+  downloadMediaMessage,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
   useMultiFileAuthState
@@ -24,6 +25,8 @@ const SESSIONS_DIR = path.resolve(process.env.SESSIONS_DIR || './sessions');
 const PRIVATE_UI_TOKEN = process.env.PRIVATE_UI_TOKEN || '';
 const MAX_STORED_MESSAGES_PER_CHAT = Number(process.env.MAX_STORED_MESSAGES_PER_CHAT || 500);
 const DB_FILE = path.resolve(process.env.DB_FILE || './data/private-core.sqlite');
+const MEDIA_DIR = path.resolve(process.env.MEDIA_DIR || './data/media');
+const SYNC_FULL_HISTORY = process.env.SYNC_FULL_HISTORY !== 'false';
 
 if (!PUBLIC_GATEWAY_URL) {
   throw new Error('PUBLIC_GATEWAY_URL is required');
@@ -35,6 +38,7 @@ if (!GATEWAY_SECRET || GATEWAY_SECRET.length < 32) {
 
 fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
+fs.mkdirSync(MEDIA_DIR, { recursive: true });
 
 const logger = pino({
   level: process.env.LOG_LEVEL || 'debug',
@@ -77,14 +81,42 @@ db.exec(`
     text TEXT,
     timestamp INTEGER NOT NULL DEFAULT 0,
     message_type TEXT NOT NULL DEFAULT 'unknown',
+    media_path TEXT,
+    media_mime TEXT,
+    media_file_name TEXT,
+    media_size INTEGER,
     raw_json TEXT,
     created_at TEXT NOT NULL,
     PRIMARY KEY (phone_number, chat_id, message_id)
   );
 
+  CREATE TABLE IF NOT EXISTS contacts (
+    phone_number TEXT NOT NULL,
+    jid TEXT NOT NULL,
+    name TEXT,
+    notify TEXT,
+    verified_name TEXT,
+    raw_json TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (phone_number, jid)
+  );
+
   CREATE INDEX IF NOT EXISTS idx_chats_account_timestamp ON chats (phone_number, timestamp DESC);
   CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp ON messages (phone_number, chat_id, timestamp ASC);
+  CREATE INDEX IF NOT EXISTS idx_messages_text ON messages (phone_number, text);
 `);
+
+function ensureColumn(tableName, columnName, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${tableName})`).all();
+  if (!columns.some((column) => column.name === columnName)) {
+    db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+  }
+}
+
+ensureColumn('messages', 'media_path', 'TEXT');
+ensureColumn('messages', 'media_mime', 'TEXT');
+ensureColumn('messages', 'media_file_name', 'TEXT');
+ensureColumn('messages', 'media_size', 'INTEGER');
 
 const statements = {
   upsertAccount: db.prepare(`
@@ -122,11 +154,13 @@ const statements = {
   upsertMessage: db.prepare(`
     INSERT INTO messages (
       phone_number, chat_id, message_id, from_me, participant, push_name,
-      text, timestamp, message_type, raw_json, created_at
+      text, timestamp, message_type, media_path, media_mime, media_file_name,
+      media_size, raw_json, created_at
     )
     VALUES (
       @phoneNumber, @chatId, @id, @fromMe, @participant, @pushName,
-      @text, @timestamp, @messageType, @rawJson, @createdAt
+      @text, @timestamp, @messageType, @mediaPath, @mediaMime, @mediaFileName,
+      @mediaSize, @rawJson, @createdAt
     )
     ON CONFLICT(phone_number, chat_id, message_id) DO UPDATE SET
       from_me = excluded.from_me,
@@ -135,12 +169,28 @@ const statements = {
       text = excluded.text,
       timestamp = excluded.timestamp,
       message_type = excluded.message_type,
+      media_path = COALESCE(excluded.media_path, messages.media_path),
+      media_mime = COALESCE(excluded.media_mime, messages.media_mime),
+      media_file_name = COALESCE(excluded.media_file_name, messages.media_file_name),
+      media_size = COALESCE(excluded.media_size, messages.media_size),
       raw_json = excluded.raw_json
+  `),
+  upsertContact: db.prepare(`
+    INSERT INTO contacts (phone_number, jid, name, notify, verified_name, raw_json, updated_at)
+    VALUES (@phoneNumber, @jid, @name, @notify, @verifiedName, @rawJson, @updatedAt)
+    ON CONFLICT(phone_number, jid) DO UPDATE SET
+      name = COALESCE(NULLIF(excluded.name, ''), contacts.name),
+      notify = COALESCE(NULLIF(excluded.notify, ''), contacts.notify),
+      verified_name = COALESCE(NULLIF(excluded.verified_name, ''), contacts.verified_name),
+      raw_json = excluded.raw_json,
+      updated_at = excluded.updated_at
   `),
   deleteAccountChats: db.prepare('DELETE FROM chats WHERE phone_number = ?'),
   deleteAccountMessages: db.prepare('DELETE FROM messages WHERE phone_number = ?'),
+  deleteAccountContacts: db.prepare('DELETE FROM contacts WHERE phone_number = ?'),
   selectAccounts: db.prepare('SELECT phone_number, status, error, last_update FROM accounts ORDER BY phone_number ASC'),
   selectChats: db.prepare('SELECT * FROM chats WHERE phone_number = ? ORDER BY timestamp DESC'),
+  selectContact: db.prepare('SELECT * FROM contacts WHERE phone_number = ? AND jid = ?'),
   selectMessages: db.prepare(`
     SELECT * FROM (
       SELECT * FROM messages
@@ -149,6 +199,32 @@ const statements = {
       LIMIT ?
     )
     ORDER BY timestamp ASC
+  `),
+  selectOldestMessage: db.prepare('SELECT * FROM messages WHERE phone_number = ? AND chat_id = ? ORDER BY timestamp ASC LIMIT 1'),
+  selectRawMessageById: db.prepare('SELECT raw_json FROM messages WHERE phone_number = ? AND chat_id = ? AND message_id = ? LIMIT 1'),
+  searchMessages: db.prepare(`
+    SELECT m.*, c.name AS chat_name
+    FROM messages m
+    LEFT JOIN chats c ON c.phone_number = m.phone_number AND c.chat_id = m.chat_id
+    WHERE m.phone_number = @phoneNumber
+      AND (@chatId = '' OR m.chat_id = @chatId)
+      AND (
+        LOWER(COALESCE(m.text, '')) LIKE @query
+        OR LOWER(COALESCE(m.push_name, '')) LIKE @query
+        OR LOWER(COALESCE(c.name, '')) LIKE @query
+        OR LOWER(m.chat_id) LIKE @query
+      )
+    ORDER BY m.timestamp DESC
+    LIMIT @limit
+  `),
+  exportMessages: db.prepare(`
+    SELECT m.*, c.name AS chat_name
+    FROM messages m
+    LEFT JOIN chats c ON c.phone_number = m.phone_number AND c.chat_id = m.chat_id
+    WHERE m.phone_number = @phoneNumber
+      AND (@chatId = '' OR m.chat_id = @chatId)
+      AND (@query = '' OR LOWER(COALESCE(m.text, '')) LIKE @query)
+    ORDER BY m.timestamp ASC
   `)
 };
 
@@ -180,6 +256,7 @@ const socketClientToGateway = createSocketClient(PUBLIC_GATEWAY_URL, {
 
 app.use(express.json({ limit: '256kb' }));
 app.use('/ui', express.static(path.join(__dirname, 'private-ui')));
+app.use('/ui/media', privateUiAuth, express.static(MEDIA_DIR));
 
 function normalizePhoneNumber(phoneNumber) {
   return String(phoneNumber || '').replace(/\D/g, '');
@@ -270,6 +347,35 @@ function privateUiAuth(req, res, next) {
   return next();
 }
 
+function csvEscape(value) {
+  const text = String(value == null ? '' : value);
+  if (/[",\r\n]/.test(text)) {
+    return `"${text.replace(/"/g, '""')}"`;
+  }
+  return text;
+}
+
+function exportRowsToCsv(rows) {
+  const header = ['timestamp', 'account', 'chat_id', 'chat_name', 'from_me', 'push_name', 'message_type', 'text', 'media_path'];
+  const lines = [header.join(',')];
+
+  for (const row of rows) {
+    lines.push([
+      new Date(Number(row.timestamp || 0) * 1000).toISOString(),
+      row.phone_number,
+      row.chat_id,
+      row.chat_name || '',
+      row.from_me ? 'true' : 'false',
+      row.push_name || '',
+      row.message_type || '',
+      row.text || '',
+      row.media_path || ''
+    ].map(csvEscape).join(','));
+  }
+
+  return lines.join('\n');
+}
+
 function gatewayAuth(req, res, next) {
   if (req.header('X-Gateway-Secret') !== GATEWAY_SECRET) {
     return res.status(401).json({ error: 'Unauthorized' });
@@ -332,6 +438,8 @@ function getMessageText(message) {
   if (content.imageMessage && content.imageMessage.caption) return content.imageMessage.caption;
   if (content.videoMessage && content.videoMessage.caption) return content.videoMessage.caption;
   if (content.documentMessage && content.documentMessage.caption) return content.documentMessage.caption;
+  if (content.audioMessage) return '';
+  if (content.stickerMessage) return '';
   if (content.buttonsResponseMessage && content.buttonsResponseMessage.selectedDisplayText) return content.buttonsResponseMessage.selectedDisplayText;
   if (content.listResponseMessage && content.listResponseMessage.title) return content.listResponseMessage.title;
   if (content.templateButtonReplyMessage && content.templateButtonReplyMessage.selectedDisplayText) return content.templateButtonReplyMessage.selectedDisplayText;
@@ -342,6 +450,7 @@ function getMessageText(message) {
 function toPublicMessage(message) {
   const remoteJid = message.key && message.key.remoteJid;
   const content = getMessageContent(message);
+  const mediaInfo = getMediaInfo(content);
   return {
     id: message.key && message.key.id,
     chatId: remoteJid,
@@ -350,7 +459,8 @@ function toPublicMessage(message) {
     pushName: message.pushName || '',
     text: getMessageText(message),
     timestamp: asUnixTimestamp(message.messageTimestamp),
-    messageType: Object.keys(content || {})[0] || 'unknown'
+    messageType: Object.keys(content || {})[0] || 'unknown',
+    media: mediaInfo
   };
 }
 
@@ -376,6 +486,30 @@ function toPublicChat(chat) {
   };
 }
 
+function getMediaInfo(content) {
+  const mediaTypes = [
+    ['imageMessage', 'image'],
+    ['videoMessage', 'video'],
+    ['audioMessage', 'audio'],
+    ['documentMessage', 'document'],
+    ['stickerMessage', 'sticker']
+  ];
+
+  for (const [key, kind] of mediaTypes) {
+    if (!content || !content[key]) continue;
+    const media = content[key];
+    return {
+      kind,
+      mimeType: media.mimetype || '',
+      fileName: media.fileName || media.title || '',
+      fileLength: Number(media.fileLength && media.fileLength.low ? media.fileLength.low : media.fileLength || 0),
+      caption: media.caption || ''
+    };
+  }
+
+  return null;
+}
+
 function rowToAccount(row) {
   return {
     phoneNumber: row.phone_number,
@@ -386,9 +520,11 @@ function rowToAccount(row) {
 }
 
 function rowToChat(row) {
+  const contact = statements.selectContact.get(row.phone_number, row.chat_id);
+  const contactName = contact ? (contact.name || contact.notify || contact.verified_name) : '';
   return {
     id: row.chat_id,
-    name: row.name || row.chat_id,
+    name: contactName || row.name || row.chat_id,
     subject: row.subject || undefined,
     unreadCount: row.unread_count || 0,
     timestamp: row.timestamp || 0,
@@ -407,8 +543,59 @@ function rowToMessage(row) {
     pushName: row.push_name || '',
     text: row.text || '',
     timestamp: row.timestamp || 0,
-    messageType: row.message_type || 'unknown'
+    messageType: row.message_type || 'unknown',
+    media: row.media_path ? {
+      url: `/ui/media/${encodeMediaPath(row.media_path)}`,
+      path: row.media_path,
+      mimeType: row.media_mime || '',
+      fileName: row.media_file_name || '',
+      size: row.media_size || 0
+    } : null
   };
+}
+
+function rowToSearchMessage(row) {
+  return {
+    ...rowToMessage(row),
+    accountId: row.phone_number,
+    chatName: row.chat_name || row.chat_id
+  };
+}
+
+function encodeMediaPath(relativePath) {
+  return String(relativePath || '').split(/[\\/]/).map(encodeURIComponent).join('/');
+}
+
+function jidToSafeName(jid) {
+  return String(jid || 'unknown').replace(/[^a-zA-Z0-9@._-]/g, '_');
+}
+
+function fileExtensionFromMime(mimeType, fallback = 'bin') {
+  const map = {
+    'image/jpeg': 'jpg',
+    'image/png': 'png',
+    'image/webp': 'webp',
+    'video/mp4': 'mp4',
+    'audio/ogg': 'ogg',
+    'audio/mpeg': 'mp3',
+    'application/pdf': 'pdf'
+  };
+
+  return map[mimeType] || fallback;
+}
+
+function storeContact(phoneNumber, contact) {
+  if (!phoneNumber || !contact || !contact.id) return;
+
+  statements.upsertContact.run({
+    phoneNumber,
+    jid: contact.id,
+    name: contact.name || '',
+    notify: contact.notify || '',
+    verifiedName: contact.verifiedName || contact.verified_name || '',
+    rawJson: JSON.stringify(contact),
+    updatedAt: new Date().toISOString()
+  });
 }
 
 function storePublicChat(phoneNumber, chat) {
@@ -434,7 +621,45 @@ function storePublicChat(phoneNumber, chat) {
   });
 }
 
-function storePublicMessage(phoneNumber, chatId, message) {
+async function downloadAndStoreMedia(phoneNumber, publicMessage, rawMessage) {
+  if (!publicMessage.media || !rawMessage || !rawMessage.message) return null;
+
+  const accountDir = path.join(MEDIA_DIR, phoneNumber);
+  const chatDir = path.join(accountDir, jidToSafeName(publicMessage.chatId));
+  fs.mkdirSync(chatDir, { recursive: true });
+
+  const extension = fileExtensionFromMime(publicMessage.media.mimeType, publicMessage.media.kind || 'bin');
+  const fileName = `${jidToSafeName(publicMessage.id || String(Date.now()))}.${extension}`;
+  const absolutePath = path.join(chatDir, fileName);
+  const relativePath = path.relative(MEDIA_DIR, absolutePath).replace(/\\/g, '/');
+
+  if (fs.existsSync(absolutePath)) {
+    return relativePath;
+  }
+
+  try {
+    const buffer = await downloadMediaMessage(
+      rawMessage,
+      'buffer',
+      {},
+      {
+        logger: logger.child({ account: phoneNumber, component: 'media-download' }),
+        reuploadRequest: (msg) => {
+          const sock = activeSockets.get(phoneNumber);
+          return sock && typeof sock.updateMediaMessage === 'function' ? sock.updateMediaMessage(msg) : undefined;
+        }
+      }
+    );
+
+    fs.writeFileSync(absolutePath, buffer);
+    return relativePath;
+  } catch (error) {
+    logger.warn({ phoneNumber, chatId: publicMessage.chatId, messageId: publicMessage.id, error: error.message }, 'failed to download media');
+    return null;
+  }
+}
+
+function storePublicMessage(phoneNumber, chatId, message, rawMessage = null) {
   if (!phoneNumber || !chatId || !message) return;
   if (!shouldExposeMessage(message)) return;
 
@@ -463,7 +688,11 @@ function storePublicMessage(phoneNumber, chatId, message) {
     text: message.text || '',
     timestamp: Number(message.timestamp || 0),
     messageType: message.messageType || 'unknown',
-    rawJson: JSON.stringify(message),
+    mediaPath: message.media && message.media.path ? message.media.path : null,
+    mediaMime: message.media && message.media.mimeType ? message.media.mimeType : null,
+    mediaFileName: message.media && message.media.fileName ? message.media.fileName : null,
+    mediaSize: message.media && message.media.size ? Number(message.media.size) : (message.media && message.media.fileLength ? Number(message.media.fileLength) : null),
+    rawJson: JSON.stringify(rawMessage || message),
     createdAt: new Date().toISOString()
   });
 
@@ -519,7 +748,7 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function ingestMessages(phoneNumber, messages, emitMessages = true) {
+async function ingestMessages(phoneNumber, messages, emitMessages = true) {
   let changed = false;
 
   for (const message of messages || []) {
@@ -528,7 +757,16 @@ function ingestMessages(phoneNumber, messages, emitMessages = true) {
     const publicMessage = toPublicMessage(message);
     if (!shouldExposeMessage(publicMessage)) continue;
 
-    storePublicMessage(phoneNumber, publicMessage.chatId, publicMessage);
+    if (publicMessage.media) {
+      const mediaPath = await downloadAndStoreMedia(phoneNumber, publicMessage, message);
+      if (mediaPath) {
+        publicMessage.media.path = mediaPath;
+        publicMessage.media.url = `/ui/media/${encodeMediaPath(mediaPath)}`;
+        publicMessage.media.size = publicMessage.media.fileLength || 0;
+      }
+    }
+
+    storePublicMessage(phoneNumber, publicMessage.chatId, publicMessage, message);
     changed = true;
 
     if (emitMessages) {
@@ -568,9 +806,42 @@ async function backfillChatMessages(phoneNumber, chatId, count = 30) {
 
   try {
     const messages = await sock.loadMessages(chatId, count, cursor);
-    ingestMessages(phoneNumber, messages || [], false);
+    await ingestMessages(phoneNumber, messages || [], false);
   } catch (error) {
     logger.warn({ phoneNumber, chatId, error: error.message }, 'failed to backfill chat messages');
+  }
+}
+
+async function fetchOlderHistory(phoneNumber, chatId, count = 50) {
+  const sock = activeSockets.get(phoneNumber);
+  if (!sock || typeof sock.fetchMessageHistory !== 'function') {
+    return { fetched: 0, supported: false };
+  }
+
+  const oldest = statements.selectOldestMessage.get(phoneNumber, chatId);
+  if (!oldest) {
+    await backfillChatMessages(phoneNumber, chatId, count);
+    return { fetched: getMessagesSnapshot(phoneNumber, chatId).length, supported: true };
+  }
+
+  const oldestKey = {
+    remoteJid: chatId,
+    id: oldest.message_id,
+    fromMe: Boolean(oldest.from_me)
+  };
+
+  if (oldest.participant) {
+    oldestKey.participant = oldest.participant;
+  }
+
+  try {
+    const result = await sock.fetchMessageHistory(count, oldestKey, oldest.timestamp);
+    const messages = Array.isArray(result) ? result : (result && result.messages ? result.messages : []);
+    await ingestMessages(phoneNumber, messages, false);
+    return { fetched: messages.length, supported: true };
+  } catch (error) {
+    logger.warn({ phoneNumber, chatId, error: error.message }, 'failed to fetch older history');
+    return { fetched: 0, supported: true, error: error.message };
   }
 }
 
@@ -599,6 +870,20 @@ function normalizeRecipient(to) {
   const digits = value.replace(/\D/g, '');
   if (!digits) return '';
   return `${digits}@s.whatsapp.net`;
+}
+
+async function getStoredBaileysMessage(phoneNumber, key) {
+  if (!key || !key.remoteJid || !key.id) return undefined;
+
+  try {
+    const row = statements.selectRawMessageById.get(phoneNumber, key.remoteJid, key.id);
+    if (!row || !row.raw_json) return undefined;
+    const parsed = JSON.parse(row.raw_json);
+    return parsed.message;
+  } catch (error) {
+    logger.warn({ phoneNumber, error: error.message }, 'failed to read stored message for retry');
+    return undefined;
+  }
 }
 
 async function getBaileysVersion() {
@@ -633,6 +918,7 @@ async function createSession(phoneNumber, options = {}) {
 
   const shouldRequestPairing = options.requestPairing !== false;
   const authExists = hasExistingAuth(normalizedPhone);
+  const registeredAuth = hasRegisteredAuth(normalizedPhone);
   let pairingCodeRequested = false;
 
   setStatus(normalizedPhone, authExists ? 'connecting' : 'pending');
@@ -648,7 +934,9 @@ async function createSession(phoneNumber, options = {}) {
     version,
     logger: logger.child({ account: normalizedPhone }),
     printQRInTerminal: false,
-    browser: Browsers.ubuntu('Chrome')
+    browser: shouldRequestPairing && !registeredAuth ? Browsers.ubuntu('Chrome') : Browsers.macOS('Desktop'),
+    syncFullHistory: SYNC_FULL_HISTORY,
+    getMessage: (key) => getStoredBaileysMessage(normalizedPhone, key)
   });
 
   activeSockets.set(normalizedPhone, sock);
@@ -714,7 +1002,9 @@ async function createSession(phoneNumber, options = {}) {
   });
 
   sock.ev.on('messages.upsert', ({ messages }) => {
-    ingestMessages(normalizedPhone, messages || [], true);
+    ingestMessages(normalizedPhone, messages || [], true).catch((error) => {
+      logger.error({ phoneNumber: normalizedPhone, error: error.message }, 'failed to ingest messages');
+    });
   });
 
   sock.ev.on('chats.upsert', (chats) => {
@@ -725,10 +1015,30 @@ async function createSession(phoneNumber, options = {}) {
     mergeAndSendChats(normalizedPhone, chats);
   });
 
-  sock.ev.on('messaging-history.set', ({ chats, messages }) => {
+  sock.ev.on('messaging-history.set', ({ chats, contacts, messages }) => {
     mergeAndSendChats(normalizedPhone, chats || []);
 
-    ingestMessages(normalizedPhone, messages || [], true);
+    for (const contact of contacts || []) {
+      storeContact(normalizedPhone, contact);
+    }
+
+    ingestMessages(normalizedPhone, messages || [], true).catch((error) => {
+      logger.error({ phoneNumber: normalizedPhone, error: error.message }, 'failed to ingest history messages');
+    });
+  });
+
+  sock.ev.on('contacts.upsert', (contacts) => {
+    for (const contact of contacts || []) {
+      storeContact(normalizedPhone, contact);
+    }
+    sendChatsSnapshot(normalizedPhone);
+  });
+
+  sock.ev.on('contacts.update', (contacts) => {
+    for (const contact of contacts || []) {
+      storeContact(normalizedPhone, contact);
+    }
+    sendChatsSnapshot(normalizedPhone);
   });
 
   return sock;
@@ -797,6 +1107,80 @@ app.get('/ui/api/messages/:phoneNumber/:chatId', privateUiAuth, async (req, res)
   });
 });
 
+app.post('/ui/api/history/:phoneNumber/:chatId', privateUiAuth, async (req, res) => {
+  const phoneNumber = normalizePhoneNumber(req.params.phoneNumber);
+  const chatId = String(req.params.chatId || '');
+  const count = Math.min(Number(req.body && req.body.count ? req.body.count : 50), 100);
+
+  if (!phoneNumber || !chatId) {
+    return res.status(400).json({ error: 'phoneNumber and chatId are required' });
+  }
+
+  const result = await fetchOlderHistory(phoneNumber, chatId, count);
+  return res.json({
+    ...result,
+    phoneNumber,
+    chatId,
+    messages: getMessagesSnapshot(phoneNumber, chatId)
+  });
+});
+
+app.get('/ui/api/search', privateUiAuth, (req, res) => {
+  const phoneNumber = normalizePhoneNumber(req.query.account || '');
+  const chatId = String(req.query.chatId || '');
+  const query = String(req.query.q || '').trim().toLowerCase();
+  const limit = Math.min(Number(req.query.limit || 100), 500);
+
+  if (!phoneNumber) {
+    return res.status(400).json({ error: 'account is required' });
+  }
+
+  if (!query) {
+    return res.json({ results: [] });
+  }
+
+  const results = statements.searchMessages
+    .all({
+      phoneNumber,
+      chatId,
+      query: `%${query}%`,
+      limit
+    })
+    .map(rowToSearchMessage);
+
+  return res.json({ results });
+});
+
+app.get('/ui/api/export', privateUiAuth, (req, res) => {
+  const phoneNumber = normalizePhoneNumber(req.query.account || '');
+  const chatId = String(req.query.chatId || '');
+  const queryText = String(req.query.q || '').trim().toLowerCase();
+  const format = String(req.query.format || 'json').toLowerCase();
+
+  if (!phoneNumber) {
+    return res.status(400).json({ error: 'account is required' });
+  }
+
+  const rows = statements.exportMessages.all({
+    phoneNumber,
+    chatId,
+    query: queryText ? `%${queryText}%` : ''
+  });
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const scope = chatId ? jidToSafeName(chatId) : 'all-chats';
+
+  if (format === 'csv') {
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="whatsapp-${phoneNumber}-${scope}-${stamp}.csv"`);
+    return res.send(exportRowsToCsv(rows));
+  }
+
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="whatsapp-${phoneNumber}-${scope}-${stamp}.json"`);
+  return res.send(JSON.stringify(rows.map(rowToSearchMessage), null, 2));
+});
+
 app.post('/api/add-account', gatewayAuth, async (req, res) => {
   const phoneNumber = normalizePhoneNumber(req.body.phoneNumber);
 
@@ -834,6 +1218,7 @@ app.delete('/api/accounts/:phoneNumber', gatewayAuth, async (req, res) => {
     statements.deleteAccount.run(phoneNumber);
     statements.deleteAccountChats.run(phoneNumber);
     statements.deleteAccountMessages.run(phoneNumber);
+    statements.deleteAccountContacts.run(phoneNumber);
 
     for (const key of latestMessages.keys()) {
       if (key.startsWith(`${phoneNumber}::`)) {
@@ -930,7 +1315,7 @@ async function handleSendMessage(payload, ack) {
       messageType: 'conversation'
     };
 
-    storePublicMessage(accountId, to, publicMessage);
+    storePublicMessage(accountId, to, publicMessage, sent);
     storePublicChat(accountId, {
       id: to,
       name: to,

@@ -39,7 +39,7 @@
 
       .app {
         display: grid;
-        grid-template-rows: auto 1fr;
+        grid-template-rows: auto auto 1fr;
         min-height: 100vh;
       }
 
@@ -78,6 +78,28 @@
         white-space: nowrap;
         color: var(--muted);
         font-size: 13px;
+      }
+
+      .toolbar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-height: 54px;
+        padding: 10px 18px;
+        border-bottom: 1px solid var(--border);
+        background: #14161a;
+      }
+
+      .toolbar input {
+        height: 34px;
+        min-width: 220px;
+        flex: 1;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: var(--panel);
+        color: var(--text);
+        padding: 0 10px;
+        outline: 0;
       }
 
       .dot {
@@ -128,7 +150,7 @@
       }
 
       .scroll {
-        height: calc(100vh - 113px);
+        height: calc(100vh - 167px);
         overflow: auto;
       }
 
@@ -251,6 +273,36 @@
         text-align: right;
       }
 
+      .media {
+        margin-top: 8px;
+      }
+
+      .media img {
+        display: block;
+        max-width: min(420px, 100%);
+        max-height: 320px;
+        border-radius: 6px;
+        object-fit: contain;
+      }
+
+      .media a {
+        color: #7dd3fc;
+        font-size: 13px;
+        text-decoration: none;
+      }
+
+      .search-result {
+        width: 100%;
+        margin: 0 0 8px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--panel);
+        color: var(--text);
+        cursor: pointer;
+        padding: 10px 12px;
+        text-align: left;
+      }
+
       .auth {
         display: none;
         align-items: center;
@@ -305,6 +357,11 @@
           align-items: flex-start;
           flex-direction: column;
         }
+
+        .toolbar {
+          align-items: stretch;
+          flex-direction: column;
+        }
       }
     </style>
   </head>
@@ -325,6 +382,15 @@
           <button id="refreshButton" class="small-button" type="button">Обновить</button>
         </div>
       </header>
+
+      <form id="searchForm" class="toolbar">
+        <input id="searchInput" type="search" placeholder="Поиск по сообщениям, чатам и именам">
+        <button class="small-button" type="submit">Найти</button>
+        <button id="clearSearchButton" class="small-button" type="button">Сброс</button>
+        <button id="loadOlderButton" class="small-button" type="button">Загрузить старше</button>
+        <button id="exportJsonButton" class="small-button" type="button">JSON</button>
+        <button id="exportCsvButton" class="small-button" type="button">CSV</button>
+      </form>
 
       <section class="layout">
         <aside class="column">
@@ -360,6 +426,8 @@
         messagesByChat: {},
         selectedAccount: '',
         selectedChat: '',
+        searchResults: null,
+        searchQuery: '',
         token: localStorage.getItem('privateUiToken') || '',
         socket: null
       };
@@ -370,6 +438,12 @@
         statusDot: document.getElementById('statusDot'),
         statusText: document.getElementById('statusText'),
         refreshButton: document.getElementById('refreshButton'),
+        searchForm: document.getElementById('searchForm'),
+        searchInput: document.getElementById('searchInput'),
+        clearSearchButton: document.getElementById('clearSearchButton'),
+        loadOlderButton: document.getElementById('loadOlderButton'),
+        exportJsonButton: document.getElementById('exportJsonButton'),
+        exportCsvButton: document.getElementById('exportCsvButton'),
         accountsCount: document.getElementById('accountsCount'),
         chatsCount: document.getElementById('chatsCount'),
         accountsList: document.getElementById('accountsList'),
@@ -424,6 +498,15 @@
         return data;
       }
 
+      function tokenQuery() {
+        return state.token ? `token=${encodeURIComponent(state.token)}` : '';
+      }
+
+      function withToken(url) {
+        if (!state.token) return url;
+        return `${url}${url.includes('?') ? '&' : '?'}${tokenQuery()}`;
+      }
+
       async function loadState() {
         const data = await api('/ui/api/state');
         state.accounts = data.accounts || [];
@@ -446,6 +529,53 @@
         if (!account || !chat) return;
         const data = await api(`/ui/api/messages/${encodeURIComponent(account)}/${encodeURIComponent(chat)}`);
         state.messagesByChat[key(account, chat)] = data.messages || [];
+      }
+
+      async function loadOlderMessages() {
+        if (!state.selectedAccount || !state.selectedChat) return;
+        const data = await fetch(`/ui/api/history/${encodeURIComponent(state.selectedAccount)}/${encodeURIComponent(state.selectedChat)}`, {
+          method: 'POST',
+          headers: Object.assign({ 'Content-Type': 'application/json' }, state.token ? { 'X-Private-Ui-Token': state.token } : {}),
+          body: JSON.stringify({ count: 50 })
+        }).then(async (response) => {
+          const payload = await response.json();
+          if (!response.ok) throw new Error(payload.error || 'Не удалось загрузить историю');
+          return payload;
+        });
+        state.messagesByChat[key(state.selectedAccount, state.selectedChat)] = data.messages || [];
+        state.searchResults = null;
+        render();
+      }
+
+      async function searchMessages() {
+        if (!state.selectedAccount) return;
+        const query = els.searchInput.value.trim();
+        state.searchQuery = query;
+        if (!query) {
+          state.searchResults = null;
+          render();
+          return;
+        }
+        const params = new URLSearchParams({
+          account: state.selectedAccount,
+          q: query,
+          limit: '200'
+        });
+        const data = await api(`/ui/api/search?${params.toString()}`);
+        state.searchResults = data.results || [];
+        render();
+      }
+
+      function exportMessages(format) {
+        if (!state.selectedAccount) return;
+        const params = new URLSearchParams({
+          account: state.selectedAccount,
+          format
+        });
+        if (state.selectedChat) params.set('chatId', state.selectedChat);
+        if (els.searchInput.value.trim()) params.set('q', els.searchInput.value.trim());
+        if (state.token) params.set('token', state.token);
+        window.location.href = `/ui/api/export?${params.toString()}`;
       }
 
       function connectSocket() {
@@ -529,6 +659,7 @@
           button.addEventListener('click', () => {
             state.selectedAccount = button.dataset.account;
             state.selectedChat = '';
+            state.searchResults = null;
             const chats = state.chatsByAccount[state.selectedAccount] || [];
             if (chats[0]) state.selectedChat = chats[0].id;
             if (state.selectedChat) loadMessages(state.selectedAccount, state.selectedChat).finally(render);
@@ -563,12 +694,37 @@
         els.chatsList.querySelectorAll('[data-chat]').forEach((button) => {
           button.addEventListener('click', () => {
             state.selectedChat = button.dataset.chat;
+            state.searchResults = null;
             loadMessages(state.selectedAccount, state.selectedChat).finally(render);
           });
         });
       }
 
       function renderMessages() {
+        if (state.searchResults) {
+          els.chatTitle.textContent = `Поиск: ${state.searchQuery}`;
+          els.chatSubtitle.textContent = `${state.searchResults.length} результатов`;
+          if (!state.searchResults.length) {
+            els.messagesList.innerHTML = '<div class="empty">Ничего не найдено</div>';
+            return;
+          }
+          els.messagesList.innerHTML = state.searchResults.map((message) => `
+            <button class="search-result" data-result-chat="${html(message.chatId)}">
+              <span class="item-title">${html(message.chatName || message.chatId)}</span>
+              <span class="item-meta">${html(formatTime(message.timestamp))} ${message.fromMe ? 'исходящее' : 'входящее'}</span>
+              <span class="text">${html(message.text || `[${message.messageType || 'message'}]`)}</span>
+            </button>
+          `).join('');
+          els.messagesList.querySelectorAll('[data-result-chat]').forEach((button) => {
+            button.addEventListener('click', () => {
+              state.selectedChat = button.dataset.resultChat;
+              state.searchResults = null;
+              loadMessages(state.selectedAccount, state.selectedChat).finally(render);
+            });
+          });
+          return;
+        }
+
         const account = state.selectedAccount;
         const chat = state.selectedChat;
         const chats = state.chatsByAccount[account] || [];
@@ -584,7 +740,7 @@
         }
 
         if (!messages.length) {
-          els.messagesList.innerHTML = '<div class="empty">Для этого чата пока нет сообщений в памяти процесса</div>';
+          els.messagesList.innerHTML = '<div class="empty">Для этого чата пока нет сохраненных сообщений</div>';
           return;
         }
 
@@ -592,12 +748,23 @@
           <div class="message-row ${message.fromMe ? 'own' : ''}">
             <div class="bubble">
               <div class="text">${html(message.text || `[${message.messageType || 'message'}]`)}</div>
+              ${renderMedia(message)}
               <div class="time">${html(message.pushName || '')} ${html(formatTime(message.timestamp))}</div>
             </div>
           </div>
         `).join('');
 
         els.messagesList.scrollTop = els.messagesList.scrollHeight;
+      }
+
+      function renderMedia(message) {
+        if (!message.media || !message.media.url) return '';
+        const label = message.media.fileName || message.media.mimeType || 'media';
+        const mediaUrl = withToken(message.media.url);
+        if (String(message.media.mimeType || '').startsWith('image/')) {
+          return `<div class="media"><a href="${html(mediaUrl)}" target="_blank" rel="noopener"><img src="${html(mediaUrl)}" alt="${html(label)}"></a></div>`;
+        }
+        return `<div class="media"><a href="${html(mediaUrl)}" target="_blank" rel="noopener">Открыть медиа: ${html(label)}</a></div>`;
       }
 
       function render() {
@@ -623,6 +790,28 @@
           els.statusText.textContent = error.message;
         });
       });
+
+      els.searchForm.addEventListener('submit', (event) => {
+        event.preventDefault();
+        searchMessages().catch((error) => {
+          els.statusText.textContent = error.message;
+        });
+      });
+
+      els.clearSearchButton.addEventListener('click', () => {
+        els.searchInput.value = '';
+        state.searchResults = null;
+        render();
+      });
+
+      els.loadOlderButton.addEventListener('click', () => {
+        loadOlderMessages().catch((error) => {
+          els.statusText.textContent = error.message;
+        });
+      });
+
+      els.exportJsonButton.addEventListener('click', () => exportMessages('json'));
+      els.exportCsvButton.addEventListener('click', () => exportMessages('csv'));
 
       connectSocket();
       loadState().catch((error) => {
