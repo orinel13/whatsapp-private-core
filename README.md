@@ -18,6 +18,7 @@ PRIVATE_PORT=4000
 PUBLIC_GATEWAY_URL=http://<IP_ПУБЛИЧНОГО_VPS>:3000
 GATEWAY_SECRET=<та же 64-символьная строка, что в front/.env>
 SESSIONS_DIR=./sessions
+DB_FILE=./data/private-core.sqlite
 ```
 
 ## Запуск
@@ -49,6 +50,34 @@ sudo ufw reload
 
 Каждый аккаунт хранится в отдельной подпапке `sessions/<phoneNumber>`. Не публикуйте эту папку и не переносите ее на публичный шлюз.
 
+## База данных
+
+Private Core сохраняет аккаунты, чаты и сообщения в SQLite:
+
+```env
+DB_FILE=./data/private-core.sqlite
+MAX_STORED_MESSAGES_PER_CHAT=500
+```
+
+Папка `data/` добавлена в `.gitignore`. При деплое после обновления зависимостей выполните:
+
+```bash
+npm install --omit=dev
+sudo systemctl restart whatsapp-private-core
+```
+
+Резервная копия базы:
+
+```bash
+sqlite3 /opt/whatsapp-private-core/data/private-core.sqlite ".backup '/opt/whatsapp-private-core/data/private-core.backup.sqlite'"
+```
+
+Если `better-sqlite3` не установится из prebuild-пакета, поставьте системные инструменты сборки и повторите `npm install`:
+
+```bash
+sudo apt install -y build-essential python3 make g++
+```
+
 ## Приватный UI
 
 Private Core также отдает read-only интерфейс просмотра:
@@ -69,7 +98,7 @@ ssh -L 4000:127.0.0.1:4000 root@<PRIVATE_VPS_IP>
 http://127.0.0.1:4000/ui
 ```
 
-UI показывает аккаунты, чаты и сообщения, которые Private Core получил после запуска процесса или через синхронизацию истории Baileys. Это не база данных: после перезапуска память очищается, но WhatsApp-сессии остаются в `sessions/`.
+UI показывает аккаунты, чаты и сообщения из SQLite. Новые входящие и исходящие сообщения сохраняются сразу. WhatsApp может не отдать всю старую историю после первой привязки, но все новые события после запуска ядра будут сохраняться в `DB_FILE`.
 
 ## Использование
 

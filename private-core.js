@@ -5,6 +5,7 @@ const path = require('path');
 const http = require('http');
 const express = require('express');
 const pino = require('pino');
+const Database = require('better-sqlite3');
 const { Server } = require('socket.io');
 const { io: createSocketClient } = require('socket.io-client');
 const {
@@ -22,6 +23,7 @@ const GATEWAY_SECRET = process.env.GATEWAY_SECRET || '';
 const SESSIONS_DIR = path.resolve(process.env.SESSIONS_DIR || './sessions');
 const PRIVATE_UI_TOKEN = process.env.PRIVATE_UI_TOKEN || '';
 const MAX_STORED_MESSAGES_PER_CHAT = Number(process.env.MAX_STORED_MESSAGES_PER_CHAT || 500);
+const DB_FILE = path.resolve(process.env.DB_FILE || './data/private-core.sqlite');
 
 if (!PUBLIC_GATEWAY_URL) {
   throw new Error('PUBLIC_GATEWAY_URL is required');
@@ -32,11 +34,123 @@ if (!GATEWAY_SECRET || GATEWAY_SECRET.length < 32) {
 }
 
 fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
 
 const logger = pino({
   level: process.env.LOG_LEVEL || 'debug',
   redact: ['req.headers["x-gateway-secret"]', '*.auth', '*.creds']
 });
+
+const db = new Database(DB_FILE);
+db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = ON');
+db.exec(`
+  CREATE TABLE IF NOT EXISTS accounts (
+    phone_number TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    error TEXT,
+    last_update TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS chats (
+    phone_number TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    name TEXT,
+    subject TEXT,
+    unread_count INTEGER NOT NULL DEFAULT 0,
+    timestamp INTEGER NOT NULL DEFAULT 0,
+    archived INTEGER NOT NULL DEFAULT 0,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    last_message TEXT,
+    raw_json TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (phone_number, chat_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS messages (
+    phone_number TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    from_me INTEGER NOT NULL DEFAULT 0,
+    participant TEXT,
+    push_name TEXT,
+    text TEXT,
+    timestamp INTEGER NOT NULL DEFAULT 0,
+    message_type TEXT NOT NULL DEFAULT 'unknown',
+    raw_json TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (phone_number, chat_id, message_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_chats_account_timestamp ON chats (phone_number, timestamp DESC);
+  CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp ON messages (phone_number, chat_id, timestamp ASC);
+`);
+
+const statements = {
+  upsertAccount: db.prepare(`
+    INSERT INTO accounts (phone_number, status, error, last_update)
+    VALUES (@phoneNumber, @status, @error, @lastUpdate)
+    ON CONFLICT(phone_number) DO UPDATE SET
+      status = excluded.status,
+      error = excluded.error,
+      last_update = excluded.last_update
+  `),
+  deleteAccount: db.prepare('DELETE FROM accounts WHERE phone_number = ?'),
+  upsertChat: db.prepare(`
+    INSERT INTO chats (
+      phone_number, chat_id, name, subject, unread_count, timestamp,
+      archived, pinned, last_message, raw_json, updated_at
+    )
+    VALUES (
+      @phoneNumber, @id, @name, @subject, @unreadCount, @timestamp,
+      @archived, @pinned, @lastMessage, @rawJson, @updatedAt
+    )
+    ON CONFLICT(phone_number, chat_id) DO UPDATE SET
+      name = COALESCE(NULLIF(excluded.name, ''), chats.name),
+      subject = COALESCE(NULLIF(excluded.subject, ''), chats.subject),
+      unread_count = excluded.unread_count,
+      timestamp = MAX(excluded.timestamp, chats.timestamp),
+      archived = excluded.archived,
+      pinned = excluded.pinned,
+      last_message = CASE
+        WHEN excluded.timestamp >= chats.timestamp THEN COALESCE(NULLIF(excluded.last_message, ''), chats.last_message)
+        ELSE chats.last_message
+      END,
+      raw_json = excluded.raw_json,
+      updated_at = excluded.updated_at
+  `),
+  upsertMessage: db.prepare(`
+    INSERT INTO messages (
+      phone_number, chat_id, message_id, from_me, participant, push_name,
+      text, timestamp, message_type, raw_json, created_at
+    )
+    VALUES (
+      @phoneNumber, @chatId, @id, @fromMe, @participant, @pushName,
+      @text, @timestamp, @messageType, @rawJson, @createdAt
+    )
+    ON CONFLICT(phone_number, chat_id, message_id) DO UPDATE SET
+      from_me = excluded.from_me,
+      participant = excluded.participant,
+      push_name = excluded.push_name,
+      text = excluded.text,
+      timestamp = excluded.timestamp,
+      message_type = excluded.message_type,
+      raw_json = excluded.raw_json
+  `),
+  deleteAccountChats: db.prepare('DELETE FROM chats WHERE phone_number = ?'),
+  deleteAccountMessages: db.prepare('DELETE FROM messages WHERE phone_number = ?'),
+  selectAccounts: db.prepare('SELECT phone_number, status, error, last_update FROM accounts ORDER BY phone_number ASC'),
+  selectChats: db.prepare('SELECT * FROM chats WHERE phone_number = ? ORDER BY timestamp DESC'),
+  selectMessages: db.prepare(`
+    SELECT * FROM (
+      SELECT * FROM messages
+      WHERE phone_number = ? AND chat_id = ?
+      ORDER BY timestamp DESC
+      LIMIT ?
+    )
+    ORDER BY timestamp ASC
+  `)
+};
 
 const app = express();
 const server = http.createServer(app);
@@ -128,6 +242,12 @@ function setStatus(phoneNumber, status, extra = {}) {
   };
 
   accountStatuses.set(phoneNumber, payload);
+  statements.upsertAccount.run({
+    phoneNumber,
+    status,
+    error: payload.error || null,
+    lastUpdate: payload.lastUpdate
+  });
   emitGateway('account-status', payload);
   logger.info({ phoneNumber, status, extra }, 'account status changed');
 }
@@ -256,6 +376,64 @@ function toPublicChat(chat) {
   };
 }
 
+function rowToAccount(row) {
+  return {
+    phoneNumber: row.phone_number,
+    status: row.status,
+    error: row.error || undefined,
+    lastUpdate: row.last_update
+  };
+}
+
+function rowToChat(row) {
+  return {
+    id: row.chat_id,
+    name: row.name || row.chat_id,
+    subject: row.subject || undefined,
+    unreadCount: row.unread_count || 0,
+    timestamp: row.timestamp || 0,
+    archived: Boolean(row.archived),
+    pinned: Boolean(row.pinned),
+    lastMessage: row.last_message || ''
+  };
+}
+
+function rowToMessage(row) {
+  return {
+    id: row.message_id,
+    chatId: row.chat_id,
+    fromMe: Boolean(row.from_me),
+    participant: row.participant || undefined,
+    pushName: row.push_name || '',
+    text: row.text || '',
+    timestamp: row.timestamp || 0,
+    messageType: row.message_type || 'unknown'
+  };
+}
+
+function storePublicChat(phoneNumber, chat) {
+  if (!phoneNumber || !chat || !chat.id) return;
+
+  const now = new Date().toISOString();
+  const publicChat = {
+    id: chat.id,
+    name: chat.name || chat.subject || chat.id,
+    subject: chat.subject || '',
+    unreadCount: Number(chat.unreadCount || 0),
+    timestamp: Number(chat.timestamp || 0),
+    archived: chat.archived ? 1 : 0,
+    pinned: chat.pinned ? 1 : 0,
+    lastMessage: chat.lastMessage || '',
+    rawJson: JSON.stringify(chat),
+    updatedAt: now
+  };
+
+  statements.upsertChat.run({
+    phoneNumber,
+    ...publicChat
+  });
+}
+
 function storePublicMessage(phoneNumber, chatId, message) {
   if (!phoneNumber || !chatId || !message) return;
   if (!shouldExposeMessage(message)) return;
@@ -275,6 +453,19 @@ function storePublicMessage(phoneNumber, chatId, message) {
   }
 
   latestMessages.set(key, messages);
+  statements.upsertMessage.run({
+    phoneNumber,
+    chatId,
+    id: message.id || `${message.timestamp || Date.now()}-${message.fromMe ? 'out' : 'in'}`,
+    fromMe: message.fromMe ? 1 : 0,
+    participant: message.participant || '',
+    pushName: message.pushName || '',
+    text: message.text || '',
+    timestamp: Number(message.timestamp || 0),
+    messageType: message.messageType || 'unknown',
+    rawJson: JSON.stringify(message),
+    createdAt: new Date().toISOString()
+  });
 
   if (message.id) {
     chatMessageCursors.set(key, {
@@ -285,22 +476,44 @@ function storePublicMessage(phoneNumber, chatId, message) {
 }
 
 function getMessagesSnapshot(phoneNumber, chatId) {
-  return latestMessages.get(`${phoneNumber}::${chatId}`) || [];
+  return statements.selectMessages
+    .all(phoneNumber, chatId, MAX_STORED_MESSAGES_PER_CHAT)
+    .map(rowToMessage);
 }
 
 function getStateSnapshot() {
   const chatsByAccount = {};
+  const accounts = statements.selectAccounts.all().map(rowToAccount);
 
-  for (const [phoneNumber, chats] of latestChats.entries()) {
-    chatsByAccount[phoneNumber] = Array.from(chats.values()).sort((a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0));
+  for (const account of accounts) {
+    chatsByAccount[account.phoneNumber] = statements.selectChats
+      .all(account.phoneNumber)
+      .map(rowToChat);
   }
 
   return {
-    accounts: Array.from(accountStatuses.values()).sort((a, b) => a.phoneNumber.localeCompare(b.phoneNumber)),
+    accounts,
     chatsByAccount,
     publicGatewayConnected: socketClientToGateway.connected
   };
 }
+
+function hydrateCachesFromDatabase() {
+  accountStatuses.clear();
+  latestChats.clear();
+
+  for (const account of statements.selectAccounts.all().map(rowToAccount)) {
+    accountStatuses.set(account.phoneNumber, account);
+
+    const chats = new Map();
+    for (const chat of statements.selectChats.all(account.phoneNumber).map(rowToChat)) {
+      chats.set(chat.id, chat);
+    }
+    latestChats.set(account.phoneNumber, chats);
+  }
+}
+
+hydrateCachesFromDatabase();
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -335,6 +548,7 @@ function ingestMessages(phoneNumber, messages, emitMessages = true) {
       lastMessage: publicMessage.text || previousChat.lastMessage || '',
       timestamp: publicMessage.timestamp
     });
+    storePublicChat(phoneNumber, accountChats.get(publicMessage.chatId));
     latestChats.set(phoneNumber, accountChats);
   }
 
@@ -535,6 +749,7 @@ function mergeAndSendChats(phoneNumber, chats) {
       ...(accountChats.get(publicChat.id) || {}),
       ...publicChat
     });
+    storePublicChat(phoneNumber, accountChats.get(publicChat.id));
   }
 
   latestChats.set(phoneNumber, accountChats);
@@ -552,7 +767,8 @@ app.get('/health', (req, res) => {
     ok: true,
     role: 'private-core',
     publicGatewayConnected: socketClientToGateway.connected,
-    accounts: accountStatuses.size
+    accounts: statements.selectAccounts.all().length,
+    dbFile: DB_FILE
   });
 });
 
@@ -615,6 +831,9 @@ app.delete('/api/accounts/:phoneNumber', gatewayAuth, async (req, res) => {
     removeSessionFiles(phoneNumber);
     accountStatuses.delete(phoneNumber);
     latestChats.delete(phoneNumber);
+    statements.deleteAccount.run(phoneNumber);
+    statements.deleteAccountChats.run(phoneNumber);
+    statements.deleteAccountMessages.run(phoneNumber);
 
     for (const key of latestMessages.keys()) {
       if (key.startsWith(`${phoneNumber}::`)) {
@@ -712,6 +931,12 @@ async function handleSendMessage(payload, ack) {
     };
 
     storePublicMessage(accountId, to, publicMessage);
+    storePublicChat(accountId, {
+      id: to,
+      name: to,
+      lastMessage: text,
+      timestamp: publicMessage.timestamp
+    });
     emitGateway('new-message', {
       phoneNumber: accountId,
       chatId: to,
@@ -749,6 +974,7 @@ process.on('SIGINT', () => {
   logger.info('shutting down');
   socketClientToGateway.close();
   privateIo.close();
+  db.close();
   server.close(() => process.exit(0));
 });
 
@@ -756,5 +982,6 @@ process.on('SIGTERM', () => {
   logger.info('shutting down');
   socketClientToGateway.close();
   privateIo.close();
+  db.close();
   server.close(() => process.exit(0));
 });
