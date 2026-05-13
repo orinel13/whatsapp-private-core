@@ -9,8 +9,10 @@ const { Server } = require('socket.io');
 const { io: createSocketClient } = require('socket.io-client');
 const {
   default: makeWASocket,
+  Browsers,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore,
   useMultiFileAuthState
 } = require('@whiskeysockets/baileys');
 
@@ -251,7 +253,7 @@ async function requestPairingCodeWithRetry(sock, phoneNumber) {
 
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
-      await delay(1500 * attempt);
+      await delay(1000 * attempt);
       const code = await sock.requestPairingCode(phoneNumber);
       return String(code).replace(/\s/g, '');
     } catch (error) {
@@ -305,6 +307,7 @@ async function createSession(phoneNumber, options = {}) {
 
   const shouldRequestPairing = options.requestPairing !== false;
   const authExists = hasExistingAuth(normalizedPhone);
+  let pairingCodeRequested = false;
 
   setStatus(normalizedPhone, authExists ? 'connecting' : 'pending');
 
@@ -312,11 +315,14 @@ async function createSession(phoneNumber, options = {}) {
   const version = await getBaileysVersion();
 
   const sock = makeWASocket({
-    auth: state,
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, logger.child({ account: normalizedPhone, component: 'signal-key-store' }))
+    },
     version,
     logger: logger.child({ account: normalizedPhone }),
     printQRInTerminal: false,
-    browser: ['Chrome (Linux)', '', '']
+    browser: Browsers.macOS('Google Chrome')
   });
 
   activeSockets.set(normalizedPhone, sock);
@@ -325,6 +331,23 @@ async function createSession(phoneNumber, options = {}) {
 
   sock.ev.on('connection.update', async (data) => {
     logger.debug({ phoneNumber: normalizedPhone, data }, 'connection update');
+
+    if (shouldRequestPairing && !sock.authState.creds.registered && !pairingCodeRequested && (data.connection === 'connecting' || data.qr)) {
+      pairingCodeRequested = true;
+
+      requestPairingCodeWithRetry(sock, normalizedPhone)
+        .then((code) => {
+          emitGateway('pairing-code', {
+            phoneNumber: normalizedPhone,
+            code
+          });
+          setStatus(normalizedPhone, 'pending');
+        })
+        .catch((error) => {
+          setStatus(normalizedPhone, 'error', { error: error.message });
+          logger.error({ phoneNumber: normalizedPhone, error: error.message }, 'failed to request pairing code');
+        });
+    }
 
     if (data.pairingCode) {
       emitGateway('pairing-code', {
@@ -413,20 +436,6 @@ async function createSession(phoneNumber, options = {}) {
       });
     }
   });
-
-  if (shouldRequestPairing && !state.creds.registered) {
-    try {
-      const code = await requestPairingCodeWithRetry(sock, normalizedPhone);
-      emitGateway('pairing-code', {
-        phoneNumber: normalizedPhone,
-        code
-      });
-      setStatus(normalizedPhone, 'pending');
-    } catch (error) {
-      setStatus(normalizedPhone, 'error', { error: error.message });
-      throw error;
-    }
-  }
 
   return sock;
 }
