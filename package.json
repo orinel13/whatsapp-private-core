@@ -1,0 +1,25 @@
+{
+  "name": "whatsapp-private-core",
+  "version": "1.0.0",
+  "description": "Private WhatsApp Multi-Device core powered by Baileys.",
+  "main": "private-core.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node private-core.js",
+    "dev": "nodemon private-core.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "6.7.19",
+    "dotenv": "17.2.2",
+    "express": "5.1.0",
+    "pino": "9.9.4",
+    "socket.io": "4.8.1",
+    "socket.io-client": "4.8.1"
+  },
+  "devDependencies": {
+    "nodemon": "3.1.10"
+  }
+}
