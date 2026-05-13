@@ -76,6 +76,46 @@ function hasExistingAuth(phoneNumber) {
   return fs.existsSync(path.join(sessionPath(phoneNumber), 'creds.json'));
 }
 
+function hasRegisteredAuth(phoneNumber) {
+  try {
+    const credsPath = path.join(sessionPath(phoneNumber), 'creds.json');
+    if (!fs.existsSync(credsPath)) return false;
+    const creds = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+    return Boolean(creds.registered);
+  } catch (error) {
+    logger.warn({ phoneNumber, error: error.message }, 'failed to read auth registration state');
+    return false;
+  }
+}
+
+function removeSessionFiles(phoneNumber) {
+  const targetPath = sessionPath(phoneNumber);
+  const resolvedTarget = path.resolve(targetPath);
+  const resolvedRoot = path.resolve(SESSIONS_DIR);
+
+  if (!resolvedTarget.startsWith(resolvedRoot + path.sep)) {
+    throw new Error('Refusing to remove a session outside SESSIONS_DIR');
+  }
+
+  fs.rmSync(resolvedTarget, { recursive: true, force: true });
+}
+
+async function stopSession(phoneNumber) {
+  const sock = activeSockets.get(phoneNumber);
+  if (!sock) return;
+
+  activeSockets.delete(phoneNumber);
+
+  try {
+    sock.ev.removeAllListeners();
+    if (sock.ws && typeof sock.ws.close === 'function') {
+      sock.ws.close();
+    }
+  } catch (error) {
+    logger.warn({ phoneNumber, error: error.message }, 'failed to close WhatsApp socket cleanly');
+  }
+}
+
 function setStatus(phoneNumber, status, extra = {}) {
   const payload = {
     phoneNumber,
@@ -202,6 +242,27 @@ function getStateSnapshot() {
   };
 }
 
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function requestPairingCodeWithRetry(sock, phoneNumber) {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      await delay(1500 * attempt);
+      const code = await sock.requestPairingCode(phoneNumber);
+      return String(code).replace(/\s/g, '');
+    } catch (error) {
+      lastError = error;
+      logger.warn({ phoneNumber, attempt, error: error.message }, 'pairing code request failed');
+    }
+  }
+
+  throw lastError || new Error('Failed to request pairing code');
+}
+
 function normalizeRecipient(to) {
   const value = String(to || '').trim();
   if (!value) return '';
@@ -229,6 +290,11 @@ async function createSession(phoneNumber, options = {}) {
   const normalizedPhone = normalizePhoneNumber(phoneNumber);
   if (!/^\d{8,15}$/.test(normalizedPhone)) {
     throw new Error('phoneNumber must contain 8-15 digits in international format without +');
+  }
+
+  if (shouldResetUnregisteredSession(normalizedPhone, options)) {
+    await stopSession(normalizedPhone);
+    removeSessionFiles(normalizedPhone);
   }
 
   const existingSocket = activeSockets.get(normalizedPhone);
@@ -350,10 +416,10 @@ async function createSession(phoneNumber, options = {}) {
 
   if (shouldRequestPairing && !state.creds.registered) {
     try {
-      const code = await sock.requestPairingCode(normalizedPhone);
+      const code = await requestPairingCodeWithRetry(sock, normalizedPhone);
       emitGateway('pairing-code', {
         phoneNumber: normalizedPhone,
-        code: String(code).replace(/\s/g, '')
+        code
       });
       setStatus(normalizedPhone, 'pending');
     } catch (error) {
@@ -363,6 +429,11 @@ async function createSession(phoneNumber, options = {}) {
   }
 
   return sock;
+}
+
+function shouldResetUnregisteredSession(phoneNumber, options) {
+  const shouldRequestPairing = options.requestPairing !== false;
+  return shouldRequestPairing && hasExistingAuth(phoneNumber) && !hasRegisteredAuth(phoneNumber);
 }
 
 function mergeAndSendChats(phoneNumber, chats) {
@@ -439,6 +510,33 @@ app.post('/api/add-account', gatewayAuth, async (req, res) => {
 app.get('/api/accounts', gatewayAuth, (req, res) => {
   const accounts = Array.from(accountStatuses.values()).sort((a, b) => a.phoneNumber.localeCompare(b.phoneNumber));
   res.json({ accounts });
+});
+
+app.delete('/api/accounts/:phoneNumber', gatewayAuth, async (req, res) => {
+  const phoneNumber = normalizePhoneNumber(req.params.phoneNumber);
+
+  if (!/^\d{8,15}$/.test(phoneNumber)) {
+    return res.status(400).json({ error: 'phoneNumber must contain 8-15 digits in international format without +' });
+  }
+
+  try {
+    await stopSession(phoneNumber);
+    removeSessionFiles(phoneNumber);
+    accountStatuses.delete(phoneNumber);
+    latestChats.delete(phoneNumber);
+
+    for (const key of latestMessages.keys()) {
+      if (key.startsWith(`${phoneNumber}::`)) {
+        latestMessages.delete(key);
+      }
+    }
+
+    emitGateway('account-status', { phoneNumber, status: 'removed', lastUpdate: new Date().toISOString() });
+    return res.json({ success: true, phoneNumber });
+  } catch (error) {
+    logger.error({ phoneNumber, error: error.message }, 'failed to remove account');
+    return res.status(500).json({ error: error.message });
+  }
 });
 
 privateIo.on('connection', (socket) => {
