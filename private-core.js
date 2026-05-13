@@ -322,7 +322,7 @@ async function createSession(phoneNumber, options = {}) {
     version,
     logger: logger.child({ account: normalizedPhone }),
     printQRInTerminal: false,
-    browser: Browsers.macOS('Google Chrome')
+    browser: Browsers.ubuntu('Chrome')
   });
 
   activeSockets.set(normalizedPhone, sock);
@@ -332,7 +332,7 @@ async function createSession(phoneNumber, options = {}) {
   sock.ev.on('connection.update', async (data) => {
     logger.debug({ phoneNumber: normalizedPhone, data }, 'connection update');
 
-    if (shouldRequestPairing && !sock.authState.creds.registered && !pairingCodeRequested && (data.connection === 'connecting' || data.qr)) {
+    if (shouldRequestPairing && !sock.authState.creds.registered && !pairingCodeRequested && data.qr) {
       pairingCodeRequested = true;
 
       requestPairingCodeWithRetry(sock, normalizedPhone)
